@@ -63,7 +63,7 @@ byte * g_srcBuffer = NULL;
 
 bool g_isHaveAudioBuffer = false;
 bool g_isStop = false;
-CRITICAL_SECTION g_AudioBuffer_SECTION;
+CRITICAL_SECTION g_Mutex_SECTION;
 CRITICAL_SECTION g_VideoBuffer_SECTION;
 CRITICAL_SECTION g_WaitThred_SECTION;
 
@@ -79,9 +79,8 @@ bool g_isSaveAudio = false;
 
 AVPacket *g_audioPack = NULL;
 
-//SDL_Window *g_screen = NULL;
-//SDL_Renderer* g_sdlRenderer = NULL;
-//SDL_Texture* g_sdlTexture = NULL;
+bool g_isStop_Video = false;
+bool g_isStop_Audio = false;
 
 #pragma endregion 
 
@@ -89,10 +88,10 @@ AVPacket *g_audioPack = NULL;
 #pragma region 可配置项
 
 long g_deviceIndex = 0;
-long g_videoW = 640;
-long g_videoH = 480;
+long g_videoW = 0 ?640:1280;
+long g_videoH = 0?480:720;
 long g_subType = 1; //YUV
-
+int  g_bit_rate_video = 4000000; //码率
 char g_outPutFileName[MAX_PATH] = "finish.mp4";
 
 wchar_t* g_audioDevName = L"audio=ocean (Realtek High Definition Audio)";
@@ -101,18 +100,18 @@ wchar_t* g_audioDevName = L"audio=ocean (Realtek High Definition Audio)";
 /** The number of output channels */
 #define OUTPUT_CHANNELS 2
 
-#define STREAM_DURATION   
-#define STREAM_FRAME_RATE 55/* 25 images/s */
+#define STREAM_DURATION   120
+#define STREAM_FRAME_RATE 25/* 25 images/s */
 #define STREAM_PIX_FMT    AV_PIX_FMT_YUV420P /* default pix_fmt */
 #define SCALE_FLAGS SWS_BICUBIC
 
-long g_SDLWindow_width = 640;
-long g_SDLWindow_height = 480;
+bool g_noEncodeAudio = false; //不编码音频
 
 #pragma endregion 
 
 #pragma region 其他
-
+static int write_video_frame(AVFormatContext *oc, OutputStream *ost);
+bool CALLBACK PreviewImage(byte * src,long width,long height,long size);
 static char *dup_wchar_to_utf8(wchar_t *w)  
 {  
 	char *s = NULL;  
@@ -133,6 +132,20 @@ static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt)
 		av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, time_base),
 		pkt->stream_index);
 }
+
+std::wstring CharToWchar(const char* c, size_t m_encode = CP_ACP)
+{
+	std::wstring str;
+	int len = MultiByteToWideChar(m_encode, 0, c, strlen(c), NULL, 0);
+	wchar_t*	m_wchar = new wchar_t[len + 1];
+	MultiByteToWideChar(m_encode, 0, c, strlen(c), m_wchar, len);
+	m_wchar[len] = '\0';
+	str = m_wchar;
+	delete m_wchar;
+	return str;
+}
+
+
 
 #pragma endregion
 
@@ -186,24 +199,7 @@ int yuv422toyuv420(unsigned char *out, const unsigned char *in, unsigned int wid
 	return 1;
 }
 
-bool CALLBACK PreviewImage(byte * src,long width,long height,long size)
-{
-	if (g_isStop)
-	{
-		return false;
-	}
-		g_isHaveBuffer = true;
 
-
-	EnterCriticalSection(&g_VideoBuffer_SECTION); 
-	static byte  *destion= new byte[size];
-
-	yuv422toyuv420(destion,src,width,height);
-	g_srcBuffer = destion;
-	LeaveCriticalSection(&g_VideoBuffer_SECTION);
-	
-	return true;
-}
 
 CmCaptureHelper m_CaptureHelper;
 bool LoadSDK()
@@ -532,6 +528,8 @@ static int encode_audio_frame(AVFrame *frame,
                               AVCodecContext *output_codec_context,
                               int *data_present)
 {
+
+
     /** Packet used for temporary storage. */
     AVPacket output_packet;
     int error;
@@ -543,6 +541,11 @@ static int encode_audio_frame(AVFrame *frame,
         pts += frame->nb_samples;
     }
 
+	if (g_noEncodeAudio)
+	{
+		av_packet_unref(&output_packet);
+		return 0;
+	}
     /**
      * Encode the audio frame and store it in the temporary packet.
      * The output audio stream encoder is used to do this.
@@ -563,14 +566,16 @@ static int encode_audio_frame(AVFrame *frame,
 
 		g_audioPack = &output_packet;
 		log_packet(output_format_context,&output_packet);
-		if ((error = av_write_frame(output_format_context, &output_packet)) < 0) {
+		EnterCriticalSection(&g_Mutex_SECTION);
+		if ((error = av_interleaved_write_frame(output_format_context, &output_packet)) < 0) {
 			fprintf(stderr, "Could not write frame (error '%s')\n",
 				av_err2str(error));
 			av_packet_unref(&output_packet);
 
-			
+			LeaveCriticalSection(&g_Mutex_SECTION);
 			return error;
 		}
+		LeaveCriticalSection(&g_Mutex_SECTION);
 
         av_packet_unref(&output_packet);
     }
@@ -610,6 +615,10 @@ static int load_encode_and_write(AVAudioFifo *fifo,
                                  AVFormatContext *output_format_context,
                                  AVCodecContext *output_codec_context)
 {
+	if (g_isStop)
+	{
+		return 1;
+	}
 	int nb_samples = 0;
     /** Temporary storage of the output samples of the frame written to the file. */
 	if (output_codec_context->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE)
@@ -659,6 +668,7 @@ static int load_encode_and_write(AVAudioFifo *fifo,
 	}
 
 	output_frame->pts = g_audio_stream_out.next_pts;
+	//g_audio_stream_out.next_pts  += output_frame->nb_samples;
 	g_audio_stream_out.next_pts  += output_frame->nb_samples;
 
 
@@ -674,63 +684,6 @@ static int load_encode_and_write(AVAudioFifo *fifo,
 }
 
 
-void FuncAudio(void* parm)
-{
-	  AVAudioFifo *fifo = NULL;
-	  if (init_fifo(&fifo, g_audio_stream_out.enc))
-	  {
-
-		  return;
-	  }
-
-	  while(!g_isStop)
-	  {
-		  if(::GetAsyncKeyState(VK_LSHIFT)) /* */
-		  {
-
-			  g_isStop = true;
-			  break;
-		  }
-	
-		  int finished                = 0;
-		   const int output_frame_size = g_audio_stream_out.enc->frame_size;
-		    while (av_audio_fifo_size(fifo) < output_frame_size  &&  !g_isStop) {
-				if (read_decode_convert_and_store(fifo, g_pFormatCtx_Audio,
-					g_input_codec_context_audio,
-					g_audio_stream_out.enc,
-					g_resample_context, &finished))
-				{
-					continue;
-				}
-			
-			}
-			g_isHaveAudioBuffer = true;
-
-			while (av_audio_fifo_size(fifo) >= output_frame_size ||
-				(av_audio_fifo_size(fifo) > 0))
-			{
-				if (g_isStop)
-				{
-					break;
-				}
-
-				/*	EnterCriticalSection(&g_AudioBuffer_SECTION);
-
-				g_fifo_audio = fifo;
-				LeaveCriticalSection(&g_AudioBuffer_SECTION);
-				*/
-				if (load_encode_and_write(fifo,g_pFormatCtx_Out,g_audio_stream_out.enc))
-				{
-					
-					break;
-				}
-			
-			}
-
-	  }
-
-
-}
 
 
 /** Open an input file and the required decoder. */
@@ -809,7 +762,7 @@ static int open_dshowDevice(const char *filename,
 
 int StartAudio()
 {
-	InitializeCriticalSection(&g_AudioBuffer_SECTION);	
+	
 	int re = open_dshowDevice(dup_wchar_to_utf8(g_audioDevName),&g_pFormatCtx_Audio,&g_input_codec_context_audio);
 	if (re )
 	{
@@ -908,7 +861,7 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc,
     case AVMEDIA_TYPE_VIDEO:
         c->codec_id = codec_id;
 
-        c->bit_rate = 400000;
+        c->bit_rate = g_bit_rate_video;
         /* Resolution must be a multiple of two. */
         c->width    = g_videoW;
         c->height   = g_videoH;
@@ -973,7 +926,11 @@ static void open_video(AVFormatContext *oc, AVCodec *codec, OutputStream *ost, A
     AVCodecContext *c = ost->enc;
     AVDictionary *opt = NULL;
 
-    av_dict_copy(&opt, opt_arg, 0);
+
+	//av_opt_set(c->priv_data, "preset", "slow", 0);
+
+	//av_opt_set(c->priv_data, "tune", "zerolatency", 0);
+   // av_dict_copy(&opt, opt_arg, 0);
 
     /* open the codec */
     ret = avcodec_open2(c, codec, &opt);
@@ -1097,7 +1054,6 @@ static int init_resampler(AVCodecContext *input_codec_context,
 }
 #pragma endregion 
 
-
 #pragma region 合成流
 
 int OpenOutPut()
@@ -1174,10 +1130,11 @@ static AVFrame *get_video_frame(OutputStream *ost)
 
     /* check if we want to generate more frames */
 	//AVRational r = {1,1 };
- //   if (av_compare_ts(ost->next_pts, c->time_base,
- //                     STREAM_DURATION, r) >= 0)
- //       return NULL;
-
+	//if (av_compare_ts(ost->next_pts, c->time_base,
+	//	STREAM_DURATION, r) >= 0)
+	//{
+	//	return NULL;
+	//}
     /* when we pass a frame to the encoder, it may keep a reference to it
      * internally; make sure we do not overwrite it here */
     if (av_frame_make_writable(ost->frame) < 0)
@@ -1219,6 +1176,10 @@ static int write_frame(AVFormatContext *fmt_ctx, const AVRational *time_base, AV
 
 	/* Write the compressed frame to the media file. */
 	log_packet(fmt_ctx, pkt);
+	if (g_isStop)
+	{
+		return 1;
+	}
 	return av_interleaved_write_frame(fmt_ctx, pkt);
 }
 static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
@@ -1241,53 +1202,46 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
 		fprintf(stderr, "Error encoding video frame: %s\n", av_err2str(ret));
 		exit(1);
 	}
-
+	EnterCriticalSection(&g_Mutex_SECTION);
 	if (got_packet) {
 		ret = write_frame(oc, &c->time_base, ost->st, &pkt);
 	} else {
 		ret = 0;
 	}
-
+	LeaveCriticalSection(&g_Mutex_SECTION);
 	if (ret < 0) {
 		fprintf(stderr, "Error while writing video frame: %s\n", av_err2str(ret));
-	//	exit(1);
+		exit(1);
 	}
 
 	return (frame || got_packet) ? 0 : 1;
 }
 int GenerateOutFile(bool encode_video,bool encode_audio)
 {
-	while (encode_video || encode_audio) {
+	while (encode_video) {
 
-		if(::GetAsyncKeyState(VK_LSHIFT)) /* */
-		{
-			g_isStop = true;
-			break;
-		}
 
-	if (g_video_stream_out.enc == NULL)
+		Sleep(1000);
+
+	if (g_video_stream_out.enc == NULL )
 	{
 		break;
 	}
-		if (encode_video &&
-		(!encode_audio || av_compare_ts(g_video_stream_out.next_pts, g_video_stream_out.enc->time_base,
-		g_audio_stream_out.next_pts, g_audio_stream_out.enc->time_base) <= 0))
-		{
+	if (g_isStop)
+	{
+		return 0;
+	} 
+	/*	if (encode_video &&
+	(!encode_audio || av_compare_ts(g_video_stream_out.next_pts, g_video_stream_out.enc->time_base,
+	g_audio_stream_out.next_pts, g_audio_stream_out.enc->time_base) <= 0))
+	{
+	if (g_isStop)
+	{
+	return 0;
+	} 
+	encode_video = !write_video_frame(g_pFormatCtx_Out, &g_video_stream_out);
 
-			encode_video = !write_video_frame(g_pFormatCtx_Out, &g_video_stream_out);
-
-		}else
-		{
-			/*EnterCriticalSection(&g_AudioBuffer_SECTION);
-			if (load_encode_and_write(g_fifo_audio,g_pFormatCtx_Out,g_audio_stream_out.enc))
-			{
-
-				continue;
-			}
-			LeaveCriticalSection(&g_AudioBuffer_SECTION);*/
-
-
-		}
+	}*/
 	}
 
 
@@ -1298,34 +1252,146 @@ int GenerateOutFile(bool encode_video,bool encode_audio)
 
 #pragma endregion 
 
-
-void FuncVideo(void* parm)
+void StopFunc(void* parm)
 {
-	EnterCriticalSection(&g_WaitThred_SECTION);
 
-	int re = GenerateOutFile(true,true);
-
-	g_isStop = true;
-
-	if (!(g_pFormatCtx_Out->oformat->flags & AVFMT_NOFILE))
-		/* Close the output file. */
-		avio_flush(g_pFormatCtx_Out->pb);
-
-
-	av_write_trailer(g_pFormatCtx_Out);
-	printf("write_trailer finish\n");
-
-
-	if (!(g_pFormatCtx_Out->oformat->flags & AVFMT_NOFILE))
-		/* Close the output file. */
-		avio_closep(&g_pFormatCtx_Out->pb);
+	while(1) /* */
+	{
+		if (::GetAsyncKeyState(VK_LSHIFT))
+		{
+			g_isStop = true;
+			g_isStop_Audio = true;
+			g_isStop_Video = true;
+		}
+		
+		Sleep(500);
+	}
+}
 
 
-	CloseAudio();
+void FuncAudio(void* parm)
+{
+	AVAudioFifo *fifo = NULL;
+	if (init_fifo(&fifo, g_audio_stream_out.enc))
+	{
 
-	m_CaptureHelper.camCloseDev(g_deviceIndex);
-	m_CaptureHelper.camUnInitCameraLib();
-	LeaveCriticalSection(&g_WaitThred_SECTION);
+		return;
+	}
+	int finished                = 0;
+	while(!g_isStop)
+	{
+		g_isHaveAudioBuffer = true;
+		
+
+		const int output_frame_size = g_audio_stream_out.enc->frame_size;
+		while (av_audio_fifo_size(fifo) < output_frame_size  &&  !g_isStop) {
+			if (read_decode_convert_and_store(fifo, g_pFormatCtx_Audio,
+				g_input_codec_context_audio,
+				g_audio_stream_out.enc,
+				g_resample_context, &finished))
+			{
+				continue;
+			}
+			if (g_isStop)
+			{
+				break;
+			}
+		}
+
+
+		while (av_audio_fifo_size(fifo) >= output_frame_size ||
+			(av_audio_fifo_size(fifo) > 0))
+		{
+			if (g_isStop)
+			{
+				break;
+			}
+
+			if (av_compare_ts(g_video_stream_out.next_pts, g_video_stream_out.enc->time_base,
+				g_audio_stream_out.next_pts, g_audio_stream_out.enc->time_base) <= 0)
+			{
+				if (g_isStop_Video)
+				{
+
+					break;
+				}
+
+			}else {
+
+
+				if (load_encode_and_write(fifo,g_pFormatCtx_Out,g_audio_stream_out.enc))
+				{
+					finished = true;
+					//break;
+				}
+			}
+
+		}
+		if(g_isStop_Video)
+
+		{
+
+			int data_written;
+			/** Flush the encoder as it may have delayed frames. */
+			do {
+				if (encode_audio_frame(NULL, g_pFormatCtx_Out,
+					g_audio_stream_out.enc, &data_written))
+					break;
+			} while (data_written);
+
+			g_isStop_Audio  = true;
+				g_isStop = true;
+			
+			break;
+		}
+
+
+	}
+
+	
+
+
+}
+
+bool CALLBACK PreviewImage(byte * src,long width,long height,long size)
+{
+	
+
+	if (g_isStop)
+	{
+		return false;
+	}
+	g_isHaveBuffer = true;
+
+
+	EnterCriticalSection(&g_VideoBuffer_SECTION); 
+	static byte  *destion= new byte[size];
+
+	yuv422toyuv420(destion,src,width,height);
+	g_srcBuffer = destion;
+	LeaveCriticalSection(&g_VideoBuffer_SECTION);
+
+	if (g_video_stream_out.enc == NULL || g_audio_stream_out.enc == NULL)
+	{
+		return true;
+	}
+	if (av_compare_ts(g_video_stream_out.next_pts, g_video_stream_out.enc->time_base,
+		g_audio_stream_out.next_pts, g_audio_stream_out.enc->time_base) <= 0)
+	{
+		
+		if (write_video_frame(g_pFormatCtx_Out, &g_video_stream_out) > 0)
+		{
+			g_isStop_Video = true;
+			if (g_isStop_Audio)
+			{
+				g_isStop = true;
+			}
+		}
+		
+
+	}
+
+	return true;
 }
 
 
@@ -1335,46 +1401,42 @@ int main(int argc, char **argv)
 	//printf("请输入最终生成的文件名：");
 	//std::cin.get(g_outPutFileName,MAX_PATH);
 	//printf(g_outPutFileName);
+//	while(1)
+	{
 
+		g_isStop = false;
 	av_register_all();
 	avdevice_register_all();
-	avformat_network_init();
-	
+	//avformat_network_init();
+	InitializeCriticalSection(&g_Mutex_SECTION);
 	int re = StartVideo();
-
+	
 	re = StartAudio();
 	re = OpenOutPut();
 	InitializeCriticalSection(&g_WaitThred_SECTION);	
 
 	_beginthread(FuncAudio,0,NULL);
-	//_beginthread(FuncVideo,0,NULL);
+	_beginthread(StopFunc,0,NULL);
+
 	 re = GenerateOutFile(true,true);
 
-	g_isStop = true;
-
-	if (!(g_pFormatCtx_Out->oformat->flags & AVFMT_NOFILE))
-		/* Close the output file. */
-		avio_flush(g_pFormatCtx_Out->pb);
+	re =  av_write_trailer(g_pFormatCtx_Out);
+	 printf("write_trailer finish\n");
 
 
-	av_write_trailer(g_pFormatCtx_Out);
-	printf("write_trailer finish\n");
-
-
-	if (!(g_pFormatCtx_Out->oformat->flags & AVFMT_NOFILE))
-		/* Close the output file. */
-		avio_closep(&g_pFormatCtx_Out->pb);
-
+	 avcodec_close(g_input_codec_context_audio);
 
 	CloseAudio();
 
 	m_CaptureHelper.camCloseDev(g_deviceIndex);
 	m_CaptureHelper.camUnInitCameraLib();
-	//EnterCriticalSection(&g_WaitThred_SECTION);
-	//LeaveCriticalSection(&g_WaitThred_SECTION);
 
-	system("pause");
+	Sleep(1000);
 
+	ShellExecute(NULL,L"open",CharToWchar(g_outPutFileName).c_str(),NULL,NULL,SW_SHOWNORMAL);
+
+
+	}
 	return 0;
 }
 
